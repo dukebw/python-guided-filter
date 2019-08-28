@@ -1,6 +1,8 @@
 import numpy as np
 import scipy as sp
 import scipy.ndimage
+import torch
+import torch.nn.functional as F
 
 
 def box(img, r):
@@ -108,6 +110,8 @@ def _gf_gray(I, p, r, eps, s=None):
         eps - regularization (roughly, allowable variance of non-edge noise)
         s - subsampling factor for fast guided filter
     """
+    I = I.astype(np.float64)
+    p = p.astype(np.float64)
     if s is not None:
         Isub = sp.ndimage.zoom(I, 1/s, order=1)
         Psub = sp.ndimage.zoom(p, 1/s, order=1)
@@ -116,17 +120,52 @@ def _gf_gray(I, p, r, eps, s=None):
         Isub = I
         Psub = p
 
-
     (rows, cols) = Isub.shape
 
+    # NOTE(brendan): torch
+    k = 2*r + 1
+    pad = (r, r, r, r)
+    mean_kernel = torch.ones((1, 1, k, k), dtype=torch.float64)/k**2
+    Isub_t = torch.from_numpy(Isub).unsqueeze(0).unsqueeze(0)
+    meanI_t = F.conv2d(F.pad(Isub_t, pad=pad, mode='reflect'), mean_kernel)
+    Psub_t = torch.from_numpy(Psub).unsqueeze(0).unsqueeze(0)
+    meanP_t = F.conv2d(F.pad(Psub_t, pad=pad, mode='reflect'), mean_kernel)
+
+    corrI_t = F.conv2d(F.pad(Isub_t*Isub_t, pad=pad, mode='reflect'), mean_kernel)
+    corrIp_t = F.conv2d(F.pad(Isub_t*Psub_t, pad=pad, mode='reflect'), mean_kernel)
+    varI_t = corrI_t - meanI_t**2
+    covIp_t = corrIp_t - meanI_t*meanP_t
+
+    a_t = covIp_t / (varI_t + eps)
+    b_t = meanP_t - a_t * meanI_t
+
+    meanA_t = F.conv2d(F.pad(a_t, pad=pad, mode='reflect'), mean_kernel)
+    meanB_t = F.conv2d(F.pad(b_t, pad=pad, mode='reflect'), mean_kernel)
+
+    if s is not None:
+        meanA_t = F.interpolate(meanA_t, scale_factor=s, mode='bilinear')
+        meanB_t = F.interpolate(meanB_t, scale_factor=s, mode='bilinear')
+
+    I_t = torch.from_numpy(I).unsqueeze(0).unsqueeze(0)
+    q_t = meanA_t * I_t + meanB_t
+
+    # NOTE(brendan): numpy
     N = box(np.ones([rows, cols]), r)
 
     meanI = box(Isub, r) / N
+    rows, cols = meanI.shape
+    # NOTE(brendan): ignore border (messed up due to mirror).
+    assert np.abs(meanI_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - meanI[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
     meanP = box(Psub, r) / N
+    assert np.abs(meanP_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - meanP[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
     corrI = box(Isub * Isub, r) / N
     corrIp = box(Isub * Psub, r) / N
     varI = corrI - meanI * meanI
     covIp = corrIp - meanI * meanP
+    assert np.abs(corrI_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - corrI[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+    assert np.abs(corrIp_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - corrIp[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+    assert np.abs(varI_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - varI[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+    assert np.abs(covIp_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - covIp[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
 
 
     a = covIp / (varI + eps)
@@ -140,7 +179,24 @@ def _gf_gray(I, p, r, eps, s=None):
         meanB = sp.ndimage.zoom(meanB, s, order=1)
 
     q = meanA * I + meanB
-    return q
+
+    try:
+        assert np.abs(a_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - a[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+        assert np.abs(b_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - b[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+        if s is None:
+            r = 2*r
+            assert np.abs(meanA_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - meanA[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+            print('meanA ok')
+            assert np.abs(meanB_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - meanB[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+            print('meanB ok')
+            assert np.abs(q_t.squeeze()[r + 1:rows - r, r + 1:rows - r].numpy() - q[r + 1:rows - r, r + 1:rows - r]).max() < 1e-5
+            print('q ok')
+    except AssertionError:
+        import ipdb
+        ipdb.set_trace()
+
+    # return q
+    return q_t.squeeze().numpy()
 
 
 def _gf_colorgray(I, p, r, eps, s=None):
@@ -193,3 +249,8 @@ def test_gf():
     for i in range(3):
         tulips_smoothed[:,:,i] = guided_filter(tulips, tulips[:,:,i], r, eps)
     imageio.imwrite('tulips_smoothed.png', tulips_smoothed)
+
+
+if __name__ == '__main__':
+    with torch.no_grad():
+        test_gf()
